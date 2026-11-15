@@ -1,0 +1,501 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Local Ollama-powered DPScope combat review.
+
+This desktop companion is intentionally separate from the in-game Lua addon:
+Allods' addon runtime has no confirmed outbound HTTP client. It sends only a
+compact profile/calculator summary, not raw player IDs or the full event log.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from statistics import median
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_MODEL = "qwen3.5:27b"
+
+
+SYSTEM_INSTRUCTIONS = """Ты — аналитический помощник DPScope для Allods Online / Sunshine 6.0.
+Работай строго по переданному JSON-отчёту и профилю боя.
+
+ОБЯЗАТЕЛЬНЫЙ ПРИНЦИП АНАЛИЗА ХАРАКТЕРИСТИК:
+- Для каждого допустимого сравнения явно используй формулу ME = ΔResult / ΔStat = (Result_test - Result_base) / (Stat_test - Stat_base).
+- Дополнительно показывай ME на +100 очков: ME_100 = ME * 100. Не подменяй эту величину абсолютным DPS/HPS, разницей процентов или величиной одного удара.
+- В ответе называй Result, единицы Result, Stat, ΔStat, Result_base, Result_test, ΔResult, ME за +1 и ME за +100. Используй уже переданные baseline/test и проверяй арифметику; не придумывай отсутствующие значения.
+- Считай ME только при сопоставимых условиях и изменении одной характеристики. Указывай режим, профиль, environment_classification, длительность, способность, цель/HP, Resolve, Normal/Critical, получателя лечения, число событий и независимых боёв.
+- Профили pve и raid относятся к PvE (raid — отдельный рейдовый контекст); pvp относится к PvP. Профили heal и tank обозначают роль/набор режима, а не доказанную игровую среду: не называй их автоматически PvE или PvP.
+- Для damage/healing положительная ME означает рост результата. Для incoming отрицательная ME означает снижение входящего урона и является благоприятным защитным эффектом; не называй отрицательное значение плохим автоматически.
+- Не объединяй единицы и контексты разных способностей в одну среднюю ME и не строй абсолютный рейтинг по несовместимым сценариям. Показывай распределение сравнений по контекстам; при смешанных условиях пиши INSUFFICIENT DATA.
+- Проанализируй все переданные controlled_stat_efficiency.comparisons. Не ограничивайся первыми 25, не выбирай только удобные положительные результаты и не игнорируй отрицательные/нулевые результаты. Сверяй total_comparisons, strict_comparison_count, legacy_exploratory_comparison_count и included_events.
+- Разделяй evidence_tier=strict и evidence_tier=legacy_exploratory. Legacy сравнения без instance IDs или свежести снимка разрешено обсуждать только как гипотезы с VERY_LOW confidence; запрещено объединять их со strict ME или называть экспериментально подтверждёнными.
+- Если ожидается 1000 экспортных записей, сначала проверь input_data_coverage/import_summary: reconstructed/export_records, source_rows, combat_rows, skipped/included. Затем проверь input_event_rows, strict_valid_event_rows, legacy_exploratory_event_rows, contaminated_event_rows_excluded. Если число не совпадает или экспорт неполный, не утверждай, что все 1000 проанализированы.
+- При отсутствии валидных повторных сравнений ME не вычисляй по простому сравнению общего DPS двух разных боёв. Сообщай INSUFFICIENT DATA и предлагай тест, где меняется один стат.
+
+Правила:
+- Не пересчитывай формулы и не придумывай коэффициенты. Числа оптимизатора из отчёта считай результатом детерминированного калькулятора.
+- Не выдавай оценочные HP, сопротивления или полезное лечение за измеренные.
+- Не предлагай конкретное перераспределение очков, если в отчёте нет calculated/partial рекомендации для этой активности.
+- Отдельно анализируй УВС (DPS), лечение себя, лечение союзников и защиту (TANK); не складывай разные режимы в одну метрику.
+- Учитывай размер выборки, HP coverage, Resolve pool coverage и warnings. При низкой полноте данных предпочитай следующий тест, а не уверенный совет.
+- Сравнивай активности только с оглядкой на их собственные условия; не объявляй победителем бой только из-за большего абсолютного урона.
+- temporal_performance содержит наблюдаемые burst/sustained окна, рассчитанные по полному таймеру боя с нулевыми тихими секундами. Называй их reported/raw DPS/HPS rate; не называй Effective DPS/HPS.
+- resolve_sample_summary даёт среднюю/пиковую Решимость и долю секунд с замерами выше порога. Это sample share по секундам с событиями, не реальный временной uptime; не переименовывай его в uptime.
+- event_effectiveness разделяет reported amount и effective/excess amount estimated через HP до события. Называй overkill/overheal именно estimated, указывай HP coverage; не выдавай оценку за MEASURED target_hp_after.
+- critical_analysis содержит фактические флаги Normal/Critical и наблюдаемые суммы по способности; crit rate, amount share и ratio средних — DERIVED descriptive evidence, не доказанный универсальный критический множитель и не причинный эффект статов.
+- Изменение характеристик между боями — полезный экспериментальный фактор, а не ошибка и не повод прекращать анализ. stat_comparison является только описательной сводкой и не доказывает причинность.
+- При наличии controlled_stat_efficiency используй только сравнения, где менялась одна характеристика, остальные характеристики были в допуске, контекст события совпадал, а на каждом наборе статов было не менее трёх независимых боёв. ME на +100 теперь основана на объёме совпавшего контекста способности за секунду полного таймера боя; дополнительно показывай средний размер события, 95% CI, число боёв и событий.
+- Для Удачи используй только critical_scope=all_hits: это сравнение Normal+Critical вместе, чтобы учитывать изменение доли критов. Не сравнивай Luck только внутри Normal или только внутри Critical.
+- model_marginal_efficiency — отдельный ESTIMATED расчёт по формуле на неизменной структуре событий и фиксированных наблюдаемых пулах Решимости. Его ME/interaction/soft_knee не являются измеренным игровым эффектом или доказанным soft cap. Указывай assumptions, особенно fixed Resolve pool и крит x2.
+- Не смешивай ESTIMATED кривые формулы с DERIVED controlled_stat_efficiency. Если у характеристики status unavailable или отсутствует формула, прямо говори, что модель её не оценивает.
+- controlled_stat_efficiency имеет статус DERIVED / controlled-observational, а не доказанная причинность: actor_id/target_id теперь записываются как доступные ключи callback, но не содержат полного состояния цели; баффы/дебаффы, таланты и ротация пока не записываются. Снимок статов обновляется не чаще раза в 3 секунды; краткая смена и возврат статов между снимками может быть не обнаружена. Не называй сравнение чистым экспериментом.
+- Если controlled_stat_efficiency.status = insufficient_data или доверительный интервал включает ноль, не ранжируй характеристики по этому сравнению; напиши INSUFFICIENT DATA и предложи повторный контролируемый тест.
+- Не делай причинный вывод только по корреляции: учитывай различия целей, длительности, состава группы, ротации, бафов, HP цели и Resolve. Если условия несопоставимы, называй результат предварительным и предложи повторить тест на одинаковой цели/условиях.
+- Разделяй исходящий урон, лечение себя и союзников; абсолютные суммы не сравнивай без нормализации по времени и объёму событий. Для эффективного лечения учитывай, что overheal/ограничение недостающим HP может искажать callback.
+- Не выдумывай игровые механики, способности, свойства класса или значения характеристик, которых нет во входных данных.
+- Ясно разделяй: наблюдение, вывод, рекомендацию для теста, неопределённость.
+- Отвечай на русском, компактно и конкретно. Не называй вероятный эффект доказанным.
+
+Формат ответа:
+1. Итог по профилю.
+2. Что подтверждено данными.
+3. Что выглядит перспективным (только при наличии рекомендации калькулятора).
+4. Ограничения и риски.
+5. Следующий контролируемый тест в игре.
+"""
+
+
+def _number(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _compact_activity(profile_activity: dict[str, Any], report_item: dict[str, Any]) -> dict[str, Any]:
+    samples = profile_activity.get("samples", [])
+    mode = str(profile_activity.get("mode", "unknown")).lower()
+    hp_values = [_number(row.get("target_hp")) for row in samples if row.get("target_hp") is not None]
+    pools = [_number(row.get("resolve_pool")) for row in samples if row.get("resolve_pool") is not None]
+    hp_values = [value for value in hp_values if value is not None]
+    pools = [value for value in pools if value is not None]
+
+    simulation = report_item.get("simulation", {}) or {}
+    recommendation = report_item.get("recommendation", {}) or {}
+    compact_sim = {}
+    for key in (
+        "events", "seconds", "total_damage", "per_second_damage",
+        "nominal_heal_total", "effective_heal_total", "effective_heal_events",
+        "effective_heal_optimization_events", "effective_heal_coverage_percent",
+        "per_second_effective_heal", "incoming_total_after_defense",
+        "incoming_per_second", "bloodthirst_sustain_per_second",
+        "net_incoming_per_second", "survival_seconds", "resolve_average_after_events",
+        "resolve_final", "resolve_samples",
+    ):
+        if key in simulation:
+            compact_sim[key] = simulation[key]
+    compact_rec = {}
+    for key in (
+        "status", "objective", "added_points", "recommended_stats",
+        "base_score", "recommended_score", "estimated_gain_percent", "method", "reason",
+    ):
+        if key in recommendation:
+            compact_rec[key] = recommendation[key]
+
+    recipient_segments = {}
+    for recipient, segment in (report_item.get("recipient_segments", {}) or {}).items():
+        segment_sim = segment.get("simulation", {}) or {}
+        segment_rec = segment.get("recommendation", {}) or {}
+        recipient_segments[recipient] = {
+            "events": segment_sim.get("events"),
+            "effective_heal_total": segment_sim.get("effective_heal_total"),
+            "effective_heal_coverage_percent": segment_sim.get("effective_heal_coverage_percent"),
+            "recommendation": {
+                key: segment_rec[key] for key in (
+                    "status", "objective", "added_points", "recommended_stats",
+                    "estimated_gain_percent", "reason",
+                ) if key in segment_rec
+            },
+        }
+
+    model_me = report_item.get("model_marginal_efficiency", {}) or {}
+    compact_model = {
+        key: model_me[key]
+        for key in (
+            "status", "classification", "metric", "metric_per_second",
+            "baseline_input_quality", "baseline_model_result", "event_count", "duration_seconds",
+            "method", "resolve_policy", "critical_policy", "unavailable_stats",
+            "confidence_interval", "note",
+        )
+        if key in model_me
+    }
+    compact_model["curves"] = model_me.get("curves", {})
+    compact_model["interactions"] = model_me.get("interactions", [])[:30]
+
+    result: dict[str, Any] = {
+        "mode": mode,
+        "weight": profile_activity.get("weight", 1.0),
+        "sample_count": len(samples),
+        "target_hp": {
+            "samples": len(hp_values),
+            "mean_fraction": (sum(hp_values) / len(hp_values)) if hp_values else None,
+            "min_fraction": min(hp_values) if hp_values else None,
+            "max_fraction": max(hp_values) if hp_values else None,
+        },
+        "resolve_pool": {
+            "samples": len(pools),
+            "mean": (sum(pools) / len(pools)) if pools else None,
+            "min": min(pools) if pools else None,
+            "max": max(pools) if pools else None,
+        },
+        "simulation": compact_sim,
+        "recommendation": compact_rec,
+        "model_marginal_efficiency": compact_model,
+    }
+    if recipient_segments:
+        result["recipient_segments"] = recipient_segments
+    if simulation.get("warnings"):
+        result["simulation_warnings"] = simulation["warnings"]
+    return result
+
+
+def build_ai_payload(profile: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
+    """Build a small, ID-free summary and omit raw event rows."""
+    activities = {}
+    profile_activities = profile.get("activities", {}) or {}
+    report_activities = report.get("activities", {}) or {}
+    for name, activity in profile_activities.items():
+        activities[name] = _compact_activity(activity, report_activities.get(name, {}) or {})
+
+    character = report.get("character", {}) or {}
+    compact_character = {
+        key: character[key]
+        for key in ("crit_chance_percent", "ruthlessness_m", "bloodthirst_fraction", "max_hp_model")
+        if key in character
+    }
+    experimental = profile.get("controlled_stat_efficiency", {}) or {}
+    compact_experimental = {
+        key: experimental.get(key)
+        for key in (
+            "status", "method", "outcome_unit", "luck_method", "legacy_policy",
+            "total_comparisons", "strict_comparison_count",
+            "legacy_exploratory_comparison_count",
+            "input_event_rows", "validated_event_rows_before_contamination",
+            "strict_valid_event_rows", "legacy_exploratory_event_rows",
+            "contaminated_event_rows_excluded",
+            "minimum_stat_step", "minimum_fights_per_build",
+            "max_stat_snapshot_age_seconds", "included_events", "included_luck_all_hit_events",
+            "excluded_or_unusable", "contaminated_fights_excluded",
+            "insufficient_repeated_pairs", "limitations",
+        )
+        if key in experimental
+    }
+    compact_experimental["comparisons"] = [
+        {
+            key: item.get(key)
+            for key in (
+                "classification", "causal_status", "evidence_tier",
+                "identity_quality", "snapshot_quality", "mode", "profile",
+                "environment_classification", "duration_band", "ability", "element", "target_hp_band",
+                "target_hp_quality", "resolve_pool_band", "critical", "critical_scope", "recipient",
+                "stat", "from", "to", "delta_stat", "delta_result", "result_unit",
+                "me_formula", "marginal_efficiency_per_stat", "marginal_efficiency_unit_per_stat",
+                "marginal_efficiency_per_100", "marginal_efficiency_unit_per_100",
+                "result_direction", "beneficial_effect_per_100",
+                "baseline", "test", "mean_event_amount_delta_per_100",
+                "relative_change_per_100_percent", "confidence_interval_95_per_stat",
+                "confidence_interval_95_per_100", "confidence", "n_independent_fights",
+            )
+            if key in item
+        }
+        for item in (experimental.get("comparisons", []) or [])
+    ]
+
+    me_groups: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = {}
+    for item in (experimental.get("comparisons", []) or []):
+        group_key = (
+            str(item.get("stat", "unknown")),
+            str(item.get("mode", "unknown")),
+            str(item.get("profile", "unknown")),
+            str(item.get("critical_scope", "unknown")),
+            str(item.get("evidence_tier", "unknown")),
+        )
+        me_groups.setdefault(group_key, []).append(item)
+
+    me_summary = []
+    for (stat, mode, profile_name, critical_scope, evidence_tier), items in sorted(me_groups.items()):
+        values = [
+            float(item["marginal_efficiency_per_100"])
+            for item in items if item.get("marginal_efficiency_per_100") is not None
+        ]
+        ci_clear = sum(
+            1 for item in items
+            if item.get("confidence_interval_95_per_100")
+            and (
+                item["confidence_interval_95_per_100"][0] > 0
+                or item["confidence_interval_95_per_100"][1] < 0
+            )
+        )
+        me_summary.append({
+            "stat": stat,
+            "mode": mode,
+            "profile": profile_name,
+            "critical_scope": critical_scope,
+            "evidence_tier": evidence_tier,
+            "context_comparison_count": len(items),
+            "me_per_100_context_median": median(values) if values else None,
+            "me_per_100_context_min": min(values) if values else None,
+            "me_per_100_context_max": max(values) if values else None,
+            "positive_contexts": sum(1 for value in values if value > 0),
+            "negative_contexts": sum(1 for value in values if value < 0),
+            "zero_contexts": sum(1 for value in values if value == 0),
+            "ci_excludes_zero_contexts": ci_clear,
+            "aggregation": "distribution_across_contexts_only_not_pooled_ME",
+        })
+
+    compact_experimental["me_formula"] = "ME = (Result_test - Result_base) / (Stat_test - Stat_base)"
+    compact_experimental["me_formula_per_100"] = "ME_100 = ME * 100"
+    compact_experimental["comparison_count_total"] = len(experimental.get("comparisons", []) or [])
+    compact_experimental["comparisons_included_in_ai_payload"] = len(compact_experimental["comparisons"])
+    compact_experimental["me_summary_by_stat"] = me_summary
+
+    effectiveness = profile.get("event_effectiveness", {}) or {}
+    compact_effectiveness = {
+        key: effectiveness.get(key)
+        for key in ("status", "classification")
+        if key in effectiveness
+    }
+    compact_effectiveness["fights"] = (effectiveness.get("fights", []) or [])[:50]
+
+    critical = profile.get("critical_analysis", {}) or {}
+    compact_critical = {
+        key: critical.get(key)
+        for key in ("status", "classification")
+        if key in critical
+    }
+    compact_critical["groups"] = (critical.get("groups", []) or [])[:100]
+
+    temporal = profile.get("temporal_performance", {}) or {}
+    compact_temporal = {
+        key: temporal.get(key)
+        for key in ("status", "classification", "method", "burst_windows_seconds", "sustained_windows_seconds")
+        if key in temporal
+    }
+    compact_temporal["fights"] = (temporal.get("fights", []) or [])[:50]
+
+    payload = {
+        "product": "DPScope",
+        "game_version": "Allods Sunshine 6.0",
+        "settings": {
+            key: value for key, value in (profile.get("settings", {}) or {}).items()
+            if key in ("mode", "resolve_coefficient", "freeze_resolve_pool", "max_hp", "level")
+        },
+        "current_stats": profile.get("stats", {}),
+        "formula_assumptions": report.get("assumptions", {}),
+        "stat_model_registry": report.get("stat_model_registry", {}),
+        "character_summary": compact_character,
+        "activities": activities,
+        "cross_activity_recommendations": report.get("cross_activity_recommendations", {}),
+        "import_summary": profile.get("import_summary", {}),
+        "input_data_coverage": {
+            key: (profile.get("import_summary", {}) or {}).get(key)
+            for key in (
+                "export_records_expected", "export_records_reconstructed",
+                "export_record_count_matches", "source_rows", "combat_rows",
+                "ignored_non_combat_rows", "included_events", "skipped_events",
+            )
+            if key in (profile.get("import_summary", {}) or {})
+        },
+        "stat_comparison": profile.get("stat_comparison", {}),
+        "controlled_stat_efficiency": compact_experimental,
+        "temporal_performance": compact_temporal,
+        "event_effectiveness": compact_effectiveness,
+        "critical_analysis": compact_critical,
+        "warnings": list(dict.fromkeys(
+            list(profile.get("import_warnings", []) or []) +
+            list(report.get("warnings", []) or [])
+        )),
+    }
+    return payload
+
+
+def normalize_ollama_url(value: str) -> str:
+    """Normalize OLLAMA_HOST values such as localhost:11434 or /api URLs."""
+    base = (value or "http://localhost:11434").strip().rstrip("/")
+    if not base.startswith(("http://", "https://")):
+        base = "http://" + base
+    if base.endswith("/api"):
+        base = base[:-4]
+    return base
+
+
+def _ollama_json(url: str, body: dict[str, Any] | None = None, timeout: int = 30) -> dict[str, Any]:
+    data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
+    headers = {"Accept": "application/json"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(
+        url, data=data, headers=headers, method="POST" if data is not None else "GET"
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:2000]
+        if exc.code == 404:
+            raise RuntimeError(
+                "Ollama вернул HTTP 404: модель или endpoint не найдены. "
+                "Проверь имя модели через ollama list и при необходимости выполни "
+                f"ollama pull. {detail}"
+            ) from None
+        raise RuntimeError(f"Ollama вернул HTTP {exc.code}: {detail}") from None
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            f"Не удалось подключиться к Ollama по адресу {url}. Убедись, что Ollama "
+            f"запущена и локальный сервер доступен. Подробности: {exc.reason}"
+        ) from None
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RuntimeError(f"Ollama вернула некорректный JSON: {exc}") from None
+
+
+def list_ollama_models(base_url: str, timeout: int = 10) -> list[str]:
+    data = _ollama_json(normalize_ollama_url(base_url) + "/api/tags", timeout=timeout)
+    return [
+        str(item.get("name") or item.get("model"))
+        for item in data.get("models", [])
+        if item.get("name") or item.get("model")
+    ]
+
+
+def _model_name_matches(installed: str, requested: str) -> bool:
+    def normalize(name: str) -> str:
+        return name[:-7] if name.endswith(":latest") else name
+    return normalize(installed.strip()) == normalize(requested.strip())
+
+
+def resolve_ollama_model(models: list[str], requested: str) -> str:
+    """Resolve a generic model family to an installed concrete Ollama tag."""
+    exact = next((item for item in models if _model_name_matches(item, requested)), None)
+    if exact:
+        return exact
+
+    requested_base = requested.strip().split(":", 1)[0]
+    # A bare qwen3.5 name is a family selector. Prefer 9B as the balanced,
+    # lower-resource default, then fall back to the smallest listed variant.
+    if requested_base.lower() == "qwen3.5" and ":" not in requested.strip():
+        prefix = requested_base.lower() + ":"
+        candidates = [
+            item for item in models
+            if item.lower().startswith(prefix) and not item.lower().endswith(":latest")
+        ]
+        if candidates:
+            preferred = next(
+                (item for item in candidates if item.lower().split(":", 1)[1] == "9b"),
+                None,
+            )
+            if preferred:
+                return preferred
+            return sorted(candidates, key=lambda item: item.lower())[0]
+
+    installed = ", ".join(models) if models else "(список пуст)"
+    raise RuntimeError(
+        f"Модель {requested} не найдена в локальном Ollama. Установленные модели: {installed}. "
+        f"Укажи точное имя через --model. Для загрузки модели используй ollama pull."
+    )
+
+
+def check_ollama(base_url: str, model: str, timeout: int = 10) -> str:
+    models = list_ollama_models(base_url, timeout)
+    return resolve_ollama_model(models, model)
+
+def call_ollama(
+    payload: dict[str, Any], model: str,
+    base_url: str = "http://localhost:11434", timeout: int = 300
+) -> str:
+    """Send the compact report to the local Ollama /api/chat endpoint."""
+    request_body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_INSTRUCTIONS},
+            {
+                "role": "user",
+                "content": "Проанализируй этот компактный отчёт DPScope. Не добавляй сведения вне данных.\n\n"
+                           + json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            },
+        ],
+        "stream": False,
+    }
+    response_data = _ollama_json(
+        normalize_ollama_url(base_url) + "/api/chat", request_body, timeout=timeout
+    )
+    result = ((response_data.get("message") or {}).get("content") or "").strip()
+    if not result:
+        raise RuntimeError("Ollama вернула пустой message.content. Проверь модель и повтори запрос.")
+    return result
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Локальный AI-разбор DPScope через Ollama (без OpenAI API и API-ключа)."
+    )
+    parser.add_argument("--profile", type=Path, default=Path("aou_event_profile.json"))
+    parser.add_argument("--report", type=Path, default=Path("aou_report.json"))
+    parser.add_argument("--out", type=Path, default=Path("aou_ai_advice.md"))
+    parser.add_argument(
+        "--model", default=os.environ.get("OLLAMA_MODEL", DEFAULT_MODEL),
+        help="имя локальной модели Ollama; по умолчанию qwen3.5:27b"
+    )
+    parser.add_argument(
+        "--ollama-url", default=os.environ.get("OLLAMA_HOST", "http://localhost:11434"),
+        help="локальный адрес Ollama; по умолчанию http://localhost:11434"
+    )
+    parser.add_argument(
+        "--timeout", type=int, default=300,
+        help="тайм-аут генерации в секундах (по умолчанию 300)"
+    )
+    parser.add_argument("--check", action="store_true", help="проверить Ollama и наличие выбранной модели")
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="сохранить компактный JSON без обращения к Ollama"
+    )
+    args = parser.parse_args()
+
+    try:
+        selected_model = check_ollama(args.ollama_url, args.model)
+        if args.check:
+            models = list_ollama_models(args.ollama_url)
+            print("Ollama доступна. Установленные модели: " + ", ".join(models))
+            print(f"Выбрана модель: {selected_model}")
+            return 0
+
+        profile = json.loads(args.profile.read_text(encoding="utf-8"))
+        report = json.loads(args.report.read_text(encoding="utf-8"))
+        payload = build_ai_payload(profile, report)
+        if args.dry_run:
+            args.out.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+            )
+            print(f"Сводка без отправки сохранена: {args.out}")
+            return 0
+
+        print(
+            f"Отправляю компактную сводку локально в Ollama ({selected_model}); "
+            "внешний API и ключ не используются."
+        )
+        answer = call_ollama(payload, selected_model, args.ollama_url, args.timeout)
+        args.out.write_text(answer + "\n", encoding="utf-8")
+        print(f"Локальный AI-разбор сохранён: {args.out} (model={selected_model})")
+        return 0
+    except (OSError, json.JSONDecodeError, RuntimeError, ValueError) as exc:
+        print(f"Ошибка AI-помощника: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

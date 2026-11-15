@@ -1,0 +1,184 @@
+DPScope build 28 - Allods Sunshine 6.0
+======================================
+
+Changes
+- Analytics runs from the resolved DPScope combatant pipeline, once per event in the current fight.
+- Personal analytics are filtered to the local player; party member events are not mixed into personal totals.
+- Damage and healing phase reports use target HP snapshots where the game API exposes them.
+- Healing report separates nominal, effective and overheal values. HP-delta estimates are labelled separately; unavailable values remain unknown.
+- Defensive report exposes event components and API-reported totals separately to avoid double counting.
+- Determination pool sampling records observed values and thresholds; missing values are not converted to zero.
+- Existing DPScope commands and stored user test records are not cleared by this update.
+
+Commands
+/aou phase   - damage by target HP phase
+/aou heal    - healing efficiency and overheal
+/aou defstat - defensive event statistics
+/aou stats   - observed determination pool statistics
+/aou diff    - combined analytics summary
+
+Limitations
+- Mastery and Ruthlessness coefficients are not calibrated for Sunshine 6.0.
+- HP phase attribution depends on the game's health API and event target IDs.
+- Effective healing estimates require consecutive HP observations; reported overload is preferred when present.
+- No claim of a validated stat optimum is made without controlled combat samples.
+
+
+API integration update:
+- Added per-object EVENT_OBJECT_HEALTH_CHANGED watches for observed targets and group units.
+- Health deltas (healthDelta / healthPercentsDelta) are captured and correlated with personal damage/healing events when target, direction, and available amount agree.
+- Exact HP transitions can be marked reported; percent-only transitions remain estimated.
+- /aou stats now prints raw avatar.GetInnateStats() fields (sysName, effective, base, equipment, talents, enchants, buffs, fairyBonus, secondary) without assuming undocumented stat-name mappings.
+- /aou phase reports health-change event coverage and unknown HP samples.
+
+Caveats:
+- Health-change event ordering relative to damage/healing callbacks must be validated in Sunshine 6.0 combat.
+- Exact enemy HP and absorb values may be unavailable by design; percentage deltas are estimates for personal event attribution.
+- Innate-stat enum names are exposed by the API, but their equivalence to Mastery / Determination / Ruthlessness must be validated against the Sunshine 6.0 client before using them as optimizer coefficients.
+- No Lua runtime or in-game test has been run for this update.
+
+Healing accounting clarification:
+- Effective healing now subtracts the documented overload, wound resistance, rune wound resistance, and other absorbed-healing fields separately.
+- When overload is unavailable but HP snapshots permit an estimate, wound/debuff losses are not misreported as overheal.
+
+Additional defensive telemetry:
+- Captures player additional-health pool increases/decreases from EVENT_OBJECT_HEALTH_CHANGED as shield-pool changes.
+- These are deliberately reported as pool changes, not automatically equated with damage absorbed (expiry and other causes can also change the pool).
+- Reconstructs pre-event health ratio using healthLimitDelta when maximum HP changes in the same event.
+- Health event subscriptions are deduplicated and capped at 64 watched objects to limit event overhead; unmatched transitions are discarded instead of reused by later hits.
+
+
+Offline formula engine update:
+- Replaced the first prototype in tools/aou_formula_calculator.py with event-level DD / HEAL / TANK simulation and separate per-activity recommendations.
+- Added Might, level multiplier, Mastery, Resolve, Ruthlessness, Luck/critical expectation, Bloodthirst, Fury healing absorption, Caution, Will, Endurance/Fortitude health, school resistances, block/parry and measured rune absorption.
+- HPS optimisation now requires effective-heal evidence for every event unless allow_nominal_hps_optimization=true is explicitly selected.
+- Resolve gain is simulated per event with the pool-dependent k and once-per-second decay; no guessed fixed divisor such as 2.4 is hard-coded. A per-event resolve_divisor_multiplier may be supplied.
+- The Resolve multiplier coefficient ambiguity (0.0015 versus 0.015) is surfaced in report warnings and remains configurable.
+- Added a three-activity profile template and 21 unit tests. Greedy allocation is explicitly labelled approximate, not exhaustive.
+- This is an offline Python engine; raw event journaling/export from the live Lua addon is not yet connected.
+
+
+Offline formula engine hardening:
+- Reports damage/healing totals by target HP phase when pre-event HP is supplied, plus first-half/second-half activity rate comparisons.
+- HPS recommendations now require data that can be recalculated under alternative stats (target missing HP or an effective-heal ratio); bare fixed effective-heal totals are reported but are not reused for build comparisons.
+- Counterfactual optimisation uses expected critical probability from Luck instead of replaying historical crit/not-crit flags.
+- Missing target HP is disclosed and DD/HPS allocation recommendations are refused when Ruthlessness cannot be modelled safely.
+- Tank incoming mitigation is grouped by physical, elemental, divine and nature school, retaining separate resistance, block, parry and rune totals.
+- Resolve pool can reset on explicit player_died / owner_died event markers.
+- Formula engine has 27 unit tests covering the supplied formulas, data-coverage guards, phase/stability output and allocation budgets. Python tests were run in the development environment; the engine has not yet been connected to live Lua event export or validated with a new in-game fight.
+
+
+Formula ordering refinement:
+- Outgoing event calculation now applies resistance, block/parry and measured rune absorption before Ruthlessness, then target Caution, matching the supplied hit sequence.
+- Added a regression test ensuring an absolute rune-absorbed amount is not amplified by Ruthlessness.
+- Formula engine test suite now contains 28 tests. GitHub Actions completed successfully for the code and regression-test commits.
+
+
+Saved-record analyzer correction:
+- `tools/aou_analyze.py` now uses Resolve coefficient 0.0015 by default, matching the offline event calculator and the prose interpretation of +1.5% per 10 pool points.
+- Added `--resolve-coefficient 0.015` to explicitly compare the literal-equation interpretation; the chosen coefficient is printed in the report.
+- Added a regression test comparing both interpretations. GitHub Actions passed all 29 formula/analyzer tests.
+
+- Explicitly documented that the legacy in-game Lua optimizer still uses 0.015 while the offline calculator/analyzer default to 0.0015; no silent change was made pending a controlled Sunshine 6.0 coefficient test.
+
+
+Live diagnostics follow-up (based on the latest Sunshine 6.0 report):
+- Enemy HP phase attribution now keeps the previous percentage-only HP snapshot and uses it as the next hit's pre-hit estimate. This addresses the failure mode where every hit was classified from the current post-hit percentage. Such samples remain explicitly estimated; they are not exact HP measurements.
+- Automatic integer display of innate stats now truncates fractional API values (`floor`) instead of rounding half-up, matching the game's displayed integer convention (459/800/460 versus 460/800/461). Raw API values are still retained internally for calculations.
+- Lua runtime validation is still pending in-game. The health-change callback produced only 3 events in the supplied report, so phase results must be rechecked after this change; the code does not claim exact phase reconstruction.
+
+Whole-fight DD recommendation update:
+- The in-game DD allocator now scores Mastery / Resolve / Ruthlessness by a weighted log-average across the exact target-HP checkpoints 100%, 75%, 50%, 25% and 0%. The weights approximate an even average over the four equal HP quarters, with shared boundaries split between adjacent quarters.
+- This keeps Mastery and Resolve valuable from the opening hit while allowing Ruthlessness to contribute progressively as the target loses health; the low-HP execute phase is not allowed to dominate solely due to unusually large finishing hits.
+- The addon now samples the observed Resolve pool separately in each target-HP quarter and uses those four measured averages in the DD curve objective; phases without samples fall back to the whole-fight average.
+- This captures the observed Resolve build-up across a fight without inventing a future per-second Resolve trajectory. The target-HP buckets are based on the health value exposed at the combat event and remain subject to the existing HP attribution confidence.
+- Controlled Resolve coefficient and pool-growth validation remain outstanding.
+- No class-specific Fury/Neistoystvo mechanic was added.
+
+
+Combat API event journal extension
+----------------------------------
+- Adds per-activity summaries by damage source type and ability, plus attacker identity where exposed by the event.
+- Captures sourceTags and targetTags through CombatTagId:GetInfo() as effects present at hit time; tags are correlation context, not exact causal attribution of absorbed damage.
+- Adds received-healing breakdown by ability: nominal/effective/overheal, wound and rune-wound loss, other absorption, life-steal, criticals and lethality samples.
+- Incoming damage and received healing are captured from target-filtered raw API events independently of the DEF/IHPS display toggles. Existing legacy display tables remain gated by their original settings.
+- Separates zero-amount events into dodges, misses, mitigation, other cases, and full absorbs inferred only when the documented avoidance/mitigation factors did not trigger.
+- Adds /aou events (also /dpscope events) for a compact combat-event journal report.
+- Journal maps are bounded to 48-64 keys per category to limit memory growth.
+- API fields and semantics cross-checked against the addon API documentation; verification inside Allods Sunshine 6.0 remains necessary.
+
+- Resets the detailed API event journal at TUMeter combat start and retains the last combat report until the next fight; legacy /aou diff and /aou defstat counters remain session-wide.
+
+- Raw event diagnostics now report callback/match/accept counts. The first incoming hit to the local avatar may start the meter before analytics collection, avoiding loss of the opening strike when combat-state flags update late.
+
+- Explicitly requests personal-event activation for filtered health, damage and healing registrations, and exposes registered target/unit filter counts in /aou events for troubleshooting.
+
+
+Latest combat-log regression fixes:
+- Removed duplicate accumulation of outgoing healing in the DPScope aggregate; the aggregate and per-ability journal now count the same event once.
+- Passes the meter's resolved spell name into analytics. Received-heal ability rows are relabelled from the matching raw callback without adding the event or amount again.
+- Treats the EVENT_HEALING_RECEIVED heal value as the reported applied amount. Overload, resisted, runeResisted and absorbed are retained as separate raw modifier counters and are not subtracted from heal; overheal remains explicitly unknown unless a separate API field is confirmed.
+- School labels omit the internal ENUM_SubElement_ prefix.
+- Adds Lua regression tests for single-count healing, received-heal relabelling, non-additive modifier fields and damage-school labelling. CI runs these alongside syntax and formula tests.
+
+
+DPScope build28 — activity optimizer and event-history integration
+--------------------------------------------------------------------
+The following entries supersede earlier prototype notes where they conflict.
+
+- The in-game Resolve default is now 0.015 to match the literal formula provided by the user. Use /aou resolvecoef 0.0015 to compare the 10x-lower interpretation from the explanatory sentence. Both interpretations are explicit; the server coefficient still needs in-game calibration.
+- HPS in-game recommendations now split self-healing and ally-healing, using separately weighted target HP and observed Resolve pool. These are per-recipient mean profiles; the full HPS optimizer also uses the target-HP curve.
+- Raw combat events are now retained separately from legacy /aou rec test records. The bounded history keeps up to 1000 persisted rows; the active-fight buffer holds up to 2000. No existing saved test records are cleared.
+- /aou eventlog reports the event-history state. /aou eventexport [N] exports the most recent rows (100 by default, up to 1000) through AOUCSV chat chunks; AoU_ChatLog_To_CSV.html reconstructs a local CSV file. The addon does not claim arbitrary direct disk writes from the game Lua API.
+- Export rows include outgoing damage/healing, local incoming damage and received healing, event time/fight id, ability/school, available HP confidence, Resolve pool, M/R/U/L/S/W/B/C snapshots, player max HP, and separate defensive fields such as resistance, runes, block, parry, barrier and API totals.
+- tools/aou_event_history_to_profile.py converts CSV to per-fight DPS/HPS/TANK profiles. The offline calculator produces per-activity recommendations and a cross-activity result normalized to each activity's own baseline. HPS profiles split self and ally healing when recipient and target max HP are known.
+- Tank import conservatively reconstructs only events with usable pre-hit HP, separately reported resistance and no positive overlapping block/parry/barrier/absorb/mount components. Rune absorption is replayed separately. Inferred resistance ratings are estimates derived from observed component amounts, not direct API stat snapshots.
+- The tank model uses captured Fortitude/Will/Bloodthirst/Caution snapshots and measured max HP. Unknown class-specific Endurance base coefficients are not fabricated.
+- Resolve pool values from the log are held fixed during imported counterfactual builds because raw pre-stat hit base values are not exposed by the callback; the simulator does not invent a different Resolve trajectory for a hypothetical build.
+- The importer removes known Mastery/Resolve/Ruthlessness/critical multipliers from observed output amounts. Unknown target-side reductions remain part of the sample weight; HPS events that may already be capped are flagged and produce conservative recommendations.
+- Added regression coverage for the CSV importer, self/ally HPS, tank resistance/rune handling, Resolve coefficient selection, bounded event persistence and AOUCSV export.
+- GitHub Actions checks Lua syntax, journal tests, Python formula tests, importer tests, then packages a testable DPScope-build28 ZIP artifact. This CI does not substitute for live client validation.
+
+AI advisor and optional desktop LLM integration
+------------------------------------------------
+- Added Scripts/AoUMeterAI.lua, loaded after the stat optimizer. /aou ai on|off toggles the in-game advisor and persists its state in a separate config key without touching legacy /aou rec records.
+- /aou ai status reports the active local engine, /aou ai advice repeats the latest conclusion, and /aou ai export sends the event history to chat for local conversion.
+- The in-game advisor reports sample confidence, HP/Resolve coverage, self-versus-ally healing balance, and next controlled tests. Its deterministic observations are explicitly kept separate from the formula optimizer's numeric recommendations.
+- Added tools/aou_ai_assistant.py, an optional desktop companion using the OpenAI Responses API. It reads the formula profile/report and sends only a compact summary; raw combat rows, ability names and target identifiers are omitted. API calls occur only when the desktop script is run manually, with OPENAI_API_KEY supplied through the environment and store=false.
+- The Allods client has no confirmed outbound HTTP API, so the game does not call the remote LLM directly. The in-game toggle controls the local advisor; it does not stop a separately launched desktop Python process.
+- Added Lua and Python regression tests for the AI toggle, sample-quality scoring, recipient-specific HPS observations and privacy-conscious payload compaction.
+
+
+
+DPScope build28 — локальный AI через Ollama / Qwen 3.5
+-----------------------------------------------------
+- Внешний desktop-помощник tools/aou_ai_assistant.py переведён на локальный Ollama API /api/chat.
+- Модель по умолчанию: qwen3.5; конкретную установленную версию можно выбрать через --model или OLLAMA_MODEL.
+- Добавлена проверка сервера и наличия модели через --check; тайм-аут генерации настраивается через --timeout.
+- OpenAI API, OPENAI_API_KEY и другие облачные ключи для этого помощника больше не требуются.
+- В модель отправляется прежняя компактная сводка без сырых строк боя, названий способностей и ID игроков/целей.
+- Добавлены Python-тесты локального запроса, проверки модели, адреса Ollama и отсутствия Authorization API key.
+- Добавлена инструкция tools/README_ollama_ai.txt и включена в архив.
+- Ограничение не изменилось: игровой Lua-аддон не вызывает локальный HTTP/Python напрямую. Внешний разбор запускается вручную; /aou ai on/off управляет только встроенным советником.
+- Первичная загрузка модели Ollama требует интернета; запросы после загрузки направляются на localhost.
+
+
+Qwen model-tag selection fix:
+- The generic default name qwen3.5 now resolves to an installed concrete Ollama tag.
+- If qwen3.5:9b is installed, it is selected by default as the lower-resource option; if absent, the available qwen3.5 variant is selected.
+- An explicit --model qwen3.5:27b continues to select the larger model.
+- Model availability is checked before both --check and generation, and the resolved model name is printed.
+- Added tests for automatic 9B selection, fallback to an installed 27B-only model, and explicit 27B selection.
+
+
+Qwen 3.5 model default preference:
+- Changed the desktop AI assistant default from the generic family selector to qwen3.5:27b, matching the requested local setup.
+- qwen3.5:9b remains available explicitly via --model qwen3.5:9b or OLLAMA_MODEL.
+- Added a regression test asserting the default model constant.
+
+
+Build28 maintenance fixes
+--------------------------
+- Fixed the Russian/English OptSchA/OptSchE/OptSchN/OptSchL resource files: they were stored as UTF-16 data while the addon localization resources are UTF-8. This caused the mojibake visible in the bottom school-statistics block.
+- Added a regression test that rejects UTF-16 BOM/NUL bytes in the Russian school-label resources.
+- /aou eventfile is documented as the single AOUCSV export workflow for screenshot/OCR capture; it does not claim unsupported direct disk writes by the game client.
