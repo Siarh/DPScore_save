@@ -53,7 +53,7 @@ class GlobalInfoLayoutTests(unittest.TestCase):
         end = gui.index("\nend", start)
         block = gui[start:end]
         self.assertIn("local hasReadableRow = false", block)
-        self.assertIn("if not hasReadableRow then", block)
+        self.assertIn("if not hasReadableRow and liveCurrentFight then", block)
         self.assertIn("targetQualityLabel(data.qualityName or data.quality)", block)
         self.assertIn("local ev = Optim and Optim.LastEv and Optim.LastEv[enumMode.Dps] or nil", block)
         self.assertIn("common.IsWString", gui)
@@ -125,6 +125,24 @@ class GlobalInfoLayoutTests(unittest.TestCase):
     def test_resolve_statistics_are_updated_from_combat_events(self):
         data = (ROOT / "Scripts/AoUMeterData.lua").read_text(encoding="utf-8")
         self.assertIn("Combatant:UpdateGlobalInfo(params, spellInfo.Determination, mode)", data)
+
+
+    def test_opponent_summary_is_saved_and_shown_for_previous_fight(self):
+        gui = (ROOT / "Scripts/AoUMeterGUI.lua").read_text(encoding="utf-8")
+        data = (ROOT / "Scripts/AoUMeterData.lua").read_text(encoding="utf-8")
+        self.assertIn("self.ActiveFight == self.DPSMeter.Fight.Previous", gui)
+        self.assertIn("activeFight.AOUATargetRows", gui)
+        self.assertIn("if not hasReadableRow and liveCurrentFight then", gui)
+        self.assertIn("currentFight.AOUATargetRows = rows", data)
+        self.assertIn("if currentFight then currentFight.AOUATargetRows = nil end", data)
+
+    def test_targettest_reports_outgoing_event_pipeline(self):
+        optim = (ROOT / "Scripts/AoUMeterOptim.lua").read_text(encoding="utf-8")
+        analytics = (ROOT / "Scripts/AoUMeterAnalytics.lua").read_text(encoding="utf-8")
+        self.assertIn("outgoing callbacks/owner/accepted/other=", optim)
+        self.assertIn("diag.outgoingHitCallbacks", analytics)
+        self.assertIn("outgoingHitOwnerMatched", analytics)
+        self.assertIn("diag.lastOutgoingTarget", optim)
 
 
 if __name__ == "__main__":
