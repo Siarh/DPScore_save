@@ -339,14 +339,39 @@ function Optim.GetHealth(id)
 end
 
 
--- current target of the player (used when the target of a hit cannot be read)
+-- Current live unit target. Prefer the dedicated avatar API; unit.GetTarget
+-- is a compatibility fallback because it can return nil even while the avatar
+-- API still exposes the selected target.
 function Optim.GetTarget()
-	local ok, t = pcall(function()
-		if unit and unit.GetTarget then return unit.GetTarget(avatar.GetId()) end
-		if avatar and avatar.GetTarget then return avatar.GetTarget() end
-		return nil
-	end)
-	if ok then return t end
+	local function validTarget(id)
+		if id == nil then return nil end
+		if object and type(object.IsExist) == "function" then
+			local ok, exists = pcall(object.IsExist, id)
+			if not ok or exists ~= true then return nil end
+		end
+		if object and type(object.IsUnit) == "function" then
+			local ok, isUnit = pcall(object.IsUnit, id)
+			if not ok or isUnit ~= true then return nil end
+		end
+		return id
+	end
+	if avatar and type(avatar.GetTarget) == "function" then
+		local ok, id = pcall(avatar.GetTarget)
+		if ok then
+			id = validTarget(id)
+			if id ~= nil then return id end
+		end
+	end
+	if unit and type(unit.GetTarget) == "function" and avatar and type(avatar.GetId) == "function" then
+		local okId, playerId = pcall(avatar.GetId)
+		if okId then
+			local okTarget, id = pcall(unit.GetTarget, playerId)
+			if okTarget then
+				id = validTarget(id)
+				if id ~= nil then return id end
+			end
+		end
+	end
 	return nil
 end
 
@@ -1875,6 +1900,72 @@ function Optim.OnSlash(text)
 	elseif cmd == "auto" then
 		setk("auto", (args[3] == "off") and 0 or 1)
 		say("auto = " .. (cfg.auto == 1 and "on" or "off"))
+	elseif cmd == "targettest" then
+		local function inspectTarget(label, id)
+			if id == nil then
+				say(label .. ": nil")
+				return
+			end
+			local fields = { label .. ": id=" .. tostring(id) }
+			if object and type(object.IsExist) == "function" then
+				local ok, value = pcall(object.IsExist, id)
+				fields[#fields + 1] = "exists=" .. (ok and tostring(value) or "error")
+			end
+			if object and type(object.IsUnit) == "function" then
+				local ok, value = pcall(object.IsUnit, id)
+				fields[#fields + 1] = "unit=" .. (ok and tostring(value) or "error")
+			end
+			if object and type(object.GetName) == "function" then
+				local ok, value = pcall(object.GetName, id)
+				if ok and value ~= nil then
+					local plain = value
+					if userMods and type(userMods.FromWString) == "function" then
+						local okText, converted = pcall(userMods.FromWString, value)
+						if okText and converted ~= nil then plain = converted end
+					end
+					fields[#fields + 1] = "name=" .. tostring(plain)
+				end
+			end
+			if unit and type(unit.GetLevel) == "function" then
+				local ok, value = pcall(unit.GetLevel, id)
+				if ok and value ~= nil then fields[#fields + 1] = "level=" .. tostring(value) end
+			end
+			if Optim and type(Optim.GetHealth) == "function" then
+				local ok, current, maximum, real = pcall(Optim.GetHealth, id)
+				if ok and current ~= nil then
+					fields[#fields + 1] = "hp=" .. tostring(current) .. "/" .. tostring(maximum)
+						.. (real and "" or "%")
+				end
+			end
+			say(table.concat(fields, " | "))
+		end
+		local avatarTarget
+		if avatar and type(avatar.GetTarget) == "function" then
+			local ok, value = pcall(avatar.GetTarget)
+			if ok then avatarTarget = value end
+		end
+		local unitTarget
+		if unit and type(unit.GetTarget) == "function" and avatar and type(avatar.GetId) == "function" then
+			local okId, playerId = pcall(avatar.GetId)
+			if okId then
+				local okTarget, value = pcall(unit.GetTarget, playerId)
+				if okTarget then unitTarget = value end
+			end
+		end
+		local event = Optim.LastEv and Optim.LastEv[enumMode.Dps] or nil
+		inspectTarget("avatar.GetTarget", avatarTarget)
+		inspectTarget("unit.GetTarget", unitTarget)
+		inspectTarget("lastEvent.target", event and event.target or nil)
+		local session = AOUA and AOUA.Session or nil
+		local rows, total = {}, 0
+		if AOUA and type(AOUA.GetTargetDisplayRows) == "function" then
+			local ok, result, count = pcall(AOUA.GetTargetDisplayRows, 4)
+			if ok then rows, total = result or {}, tonumber(count) or 0 end
+		end
+		say("AOUA started=" .. tostring(session and session.started) ..
+			" damageEvents=" .. tostring(session and session.damage and session.damage.events or 0) ..
+			" profiles=" .. tostring(session and session.targetProfileCount or 0) ..
+			" displayRows=" .. tostring(#rows) .. "/" .. tostring(total))
 	elseif cmd == "hptest" then
 		local tg = Optim.GetTarget()
 		say("target id: " .. tostring(tg))

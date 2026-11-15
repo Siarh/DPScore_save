@@ -44,6 +44,7 @@ SYSTEM_INSTRUCTIONS = """Ты — аналитический помощник DP
 - Не предлагай конкретное перераспределение очков, если в отчёте нет calculated/partial рекомендации для этой активности.
 - Отдельно анализируй УВС (DPS), лечение себя, лечение союзников и защиту (TANK); не складывай разные режимы в одну метрику.
 - Учитывай размер выборки, HP coverage, Resolve pool coverage и warnings. При низкой полноте данных предпочитай следующий тест, а не уверенный совет.
+- Для исходящего damage target_signature может объединять разные экземпляры цели; для incoming actor_signature может объединять экземпляры атакующего. Сигнатура включает нормализованное имя, уровень, элитность и признак моба, но не является уникальным ID шаблона. Проверяй actor_match_basis, target_match_basis и comparison_identity_scope; не называй совпадение полной идентичностью цели. В healing получатель остаётся точным instance ID.
 - Сравнивай активности только с оглядкой на их собственные условия; не объявляй победителем бой только из-за большего абсолютного урона.
 - temporal_performance содержит наблюдаемые burst/sustained окна, рассчитанные по полному таймеру боя с нулевыми тихими секундами. Называй их reported/raw DPS/HPS rate; не называй Effective DPS/HPS.
 - resolve_sample_summary даёт среднюю/пиковую Решимость и долю секунд с замерами выше порога. Это sample share по секундам с событиями, не реальный временной uptime; не переименовывай его в uptime.
@@ -58,6 +59,10 @@ SYSTEM_INSTRUCTIONS = """Ты — аналитический помощник DP
 - Если controlled_stat_efficiency.status = insufficient_data или доверительный интервал включает ноль, не ранжируй характеристики по этому сравнению; напиши INSUFFICIENT DATA и предложи повторный контролируемый тест.
 - Не делай причинный вывод только по корреляции: учитывай различия целей, длительности, состава группы, ротации, бафов, HP цели и Resolve. Если условия несопоставимы, называй результат предварительным и предложи повторить тест на одинаковой цели/условиях.
 - Разделяй исходящий урон, лечение себя и союзников; абсолютные суммы не сравнивай без нормализации по времени и объёму событий. Для эффективного лечения учитывай, что overheal/ограничение недостающим HP может искажать callback.
+- target_statistics содержит сводки архетипов целей: категория (target_kind/target_quality_name), HP и компоненты резиста/поглощения по школе. Используй их для контекста боя, но не считай target_signature полной идентичностью или состоянием цели.
+- hp.pre_event_* различает measured_pre и estimated_pre; current_hp_snapshot — отдельный снимок API с указанным возрастом, а не гарантированное HP в момент каждого события.
+- resistance_components.resist_amount, rune_absorb_amount, absorb_amount, barrier_amount, block_amount, parry_amount и прочие поля — суммы фактических компонентов callback с числом известных событий. Это не числовой рейтинг сопротивления цели и не коэффициент резиста; не делай из них такой вывод.
+- В AI payload имена игроков скрыты, ObjectId и target_signature не передаются. Не пытайся восстановить личность цели.
 - Не выдумывай игровые механики, способности, свойства класса или значения характеристик, которых нет во входных данных.
 - Ясно разделяй: наблюдение, вывод, рекомендацию для теста, неопределённость.
 - Отвечай на русском, компактно и конкретно. Не называй вероятный эффект доказанным.
@@ -201,7 +206,13 @@ def build_ai_payload(profile: dict[str, Any], report: dict[str, Any]) -> dict[st
             key: item.get(key)
             for key in (
                 "classification", "causal_status", "evidence_tier",
-                "identity_quality", "snapshot_quality", "mode", "profile",
+                "identity_quality", "snapshot_quality",
+                "actor_match_method", "target_match_method",
+                "actor_signature", "target_signature", "actor_name", "actor_level",
+                "actor_quality", "actor_kind", "actor_is_mob", "actor_match_basis",
+                "target_name", "target_level", "target_quality", "target_quality_name",
+                "target_kind", "target_is_mob", "target_match_basis", "comparison_identity_scope",
+                "mode", "profile",
                 "environment_classification", "duration_band", "ability", "element", "target_hp_band",
                 "target_hp_quality", "resolve_pool_band", "critical", "critical_scope", "recipient",
                 "stat", "from", "to", "delta_stat", "delta_result", "result_unit",
@@ -216,6 +227,15 @@ def build_ai_payload(profile: dict[str, Any], report: dict[str, Any]) -> dict[st
         }
         for item in (experimental.get("comparisons", []) or [])
     ]
+    # Instance-level signatures are useful for strict matching inside the local
+    # profile, but not needed by the LLM. Remove them and anonymize player names.
+    for comparison in compact_experimental["comparisons"]:
+        comparison.pop("actor_signature", None)
+        comparison.pop("target_signature", None)
+        if str(comparison.get("actor_kind", "")).lower() == "player":
+            comparison["actor_name"] = "player actor"
+        if str(comparison.get("target_kind", "")).lower() == "player":
+            comparison["target_name"] = "player target"
 
     me_groups: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = {}
     for item in (experimental.get("comparisons", []) or []):
@@ -289,6 +309,36 @@ def build_ai_payload(profile: dict[str, Any], report: dict[str, Any]) -> dict[st
     }
     compact_temporal["fights"] = (temporal.get("fights", []) or [])[:50]
 
+
+    target_stats = profile.get("target_statistics", {}) or {}
+    compact_target_statistics = {
+        key: target_stats[key]
+        for key in (
+            "status", "classification", "target_signature_fields",
+            "target_profiles", "unmatched_target_events",
+            "unmatched_target_instances", "limitations",
+        )
+        if key in target_stats
+    }
+    compact_targets = []
+    for target in (target_stats.get("targets", []) or [])[:50]:
+        target_kind = str(target.get("target_kind", "unknown")).lower()
+        compact_targets.append({
+            "target_name": "player target" if target_kind == "player" else target.get("target_name"),
+            "target_level": target.get("target_level"),
+            "target_quality": target.get("target_quality"),
+            "target_quality_name": target.get("target_quality_name"),
+            "target_kind": target_kind,
+            "events": target.get("events"),
+            "fights": target.get("fights"),
+            "instances": target.get("instances"),
+            "hp": target.get("hp", {}),
+            "resistance_components": target.get("resistance_components", {}),
+            "identity_note": target.get("identity_note"),
+        })
+    compact_target_statistics["targets"] = compact_targets
+    compact_target_statistics["target_profiles_in_ai_payload"] = len(compact_targets)
+
     payload = {
         "product": "DPScope",
         "game_version": "Allods Sunshine 6.0",
@@ -317,6 +367,7 @@ def build_ai_payload(profile: dict[str, Any], report: dict[str, Any]) -> dict[st
         "temporal_performance": compact_temporal,
         "event_effectiveness": compact_effectiveness,
         "critical_analysis": compact_critical,
+        "target_statistics": compact_target_statistics,
         "warnings": list(dict.fromkeys(
             list(profile.get("import_warnings", []) or []) +
             list(report.get("warnings", []) or [])

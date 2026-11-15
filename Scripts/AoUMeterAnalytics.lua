@@ -92,7 +92,9 @@ local function freshSession()
         targetHealth = { samples = 0, estimated = 0, unknown = 0, changedEvents = 0 },
         eventSamples = {}, eventSamplesDropped = 0, eventSampleCount = 0, eventSampleNext = 1,
         elapsedSeconds = 0, fightId = 0, statSnapshot = nil,
-        statSnapshotSecond = nil, statSnapshotAttemptSecond = nil, started = false
+        statSnapshotSecond = nil, statSnapshotAttemptSecond = nil,
+        objectMetadata = {}, objectMetadataCount = 0,
+        targetProfiles = {}, targetProfileCount = 0, started = false
     }
 end
 
@@ -152,6 +154,10 @@ local function ensureSession()
     AOUA.Session.targetHealth.changedEvents = AOUA.Session.targetHealth.changedEvents or 0
     AOUA.Session.eventSamples = AOUA.Session.eventSamples or {}
     AOUA.Session.eventSamplesDropped = AOUA.Session.eventSamplesDropped or 0
+    AOUA.Session.objectMetadata = AOUA.Session.objectMetadata or {}
+    AOUA.Session.objectMetadataCount = tonumber(AOUA.Session.objectMetadataCount) or 0
+    AOUA.Session.targetProfiles = AOUA.Session.targetProfiles or {}
+    AOUA.Session.targetProfileCount = tonumber(AOUA.Session.targetProfileCount) or 0
     AOUA.Session.eventSampleCount = math.max(0, math.min(EVENT_BUFFER_LIMIT,
         math.floor(tonumber(AOUA.Session.eventSampleCount) or #AOUA.Session.eventSamples)))
     AOUA.Session.eventSampleNext = math.floor(tonumber(AOUA.Session.eventSampleNext) or
@@ -172,6 +178,13 @@ function AOUA.OnFightStart()
     AOUA.Session.journal = freshJournal()
     AOUA.Session.eventSamples = {}
     AOUA.Session.eventSamplesDropped = 0
+    AOUA.Session.objectMetadata = {}
+    AOUA.Session.objectMetadataCount = 0
+    AOUA.Session.targetProfiles = {}
+    AOUA.Session.targetProfileCount = 0
+    -- HP transitions from an earlier fight must never leak into the new fight.
+    AOUA.HpCache = {}
+    AOUA.HealthTransitions = {}
     AOUA.Session.eventSampleCount = 0
     AOUA.Session.eventSampleNext = 1
     AOUA.Session.elapsedSeconds = 0
@@ -286,7 +299,12 @@ local function recordHealthPhase(kind, params, amount, confidence)
         return nil, "unknown", nil
     end
 
-    if value ~= nil then AOUA.HpCache[id] = { value = value, limit = limit, real = real } end
+    if value ~= nil then
+        AOUA.HpCache[id] = {
+            value = value, limit = limit, real = real,
+            second = tonumber(AOUA.Session.elapsedSeconds) or 0
+        }
+    end
     local frac
     if useTransition then
         frac = transition.beforeFrac
@@ -372,7 +390,10 @@ function AOUA.OnHealthChanged(params)
         AOUA.Session.targetHealth.changedEvents = AOUA.Session.targetHealth.changedEvents + 1
     end
     if value ~= nil then
-        AOUA.HpCache[id] = { value = value, limit = limit, real = real }
+        AOUA.HpCache[id] = {
+            value = value, limit = limit, real = real,
+            second = tonumber(AOUA.Session.elapsedSeconds) or 0
+        }
     end
     local additionalDelta = tonumber(params.additionalDelta)
     if additionalDelta ~= nil and avatar and avatar.GetId then
@@ -445,7 +466,7 @@ local function abilityLabel(params, fallbackName)
 end
 
 local isLocalObject
-local EVENT_COLUMNS = "fight_id|profile|second|kind|observed_amount|target_hp_before|hp_quality|target_max_hp|actor_id|target_id|critical|element|damage_source|resist|absorb|runes_absorb|block|parry|barrier|mount|multiplier_absorb|overall_absorbed|overall_prevented|resolve_pool|recipient|ability|M|R|U|L|S|W|B|C|HPmax|stat_sample_second|stat_sample_age"
+local EVENT_COLUMNS = "fight_id|profile|second|kind|observed_amount|target_hp_before|hp_quality|target_max_hp|actor_id|target_id|critical|element|damage_source|resist|absorb|runes_absorb|block|parry|barrier|mount|multiplier_absorb|overall_absorbed|overall_prevented|resolve_pool|recipient|ability|M|R|U|L|S|W|B|C|HPmax|stat_sample_second|stat_sample_age|actor_name|actor_level|actor_quality|actor_quality_name|actor_kind|actor_is_mob|target_name|target_level|target_quality|target_quality_name|target_kind|target_is_mob|target_hp_current|target_hp_current_percent|target_hp_limit|target_hp_snapshot_quality|target_hp_snapshot_age"
 
 local function sampleNumber(value)
     local n = tonumber(value)
@@ -472,6 +493,204 @@ local function eventObjectId(value)
         end
     end
     return nil
+end
+
+
+local TARGET_METADATA_CACHE_LIMIT = 512
+local QUALITY_LABELS = {
+    "COMMON", "ELITE", "FLAVOR_ELITE", "MINI_BOSS",
+    "BOSS", "RAID_BOSS", "RAID_ELITE", "CRITTER"
+}
+
+local function qualityLabel(value)
+    local numeric = tonumber(value)
+    if numeric == nil then return "" end
+    for i = 1, #QUALITY_LABELS do
+        local name = QUALITY_LABELS[i]
+        local constant = (_G and _G["UNIT_QUALITY_" .. name]) or nil
+        if constant ~= nil and tonumber(constant) == numeric then return name end
+    end
+    return "ENUM:" .. tostring(numeric)
+end
+
+-- Cache descriptive data by ObjectId for this fight. ObjectId identifies an
+-- instance; cross-fight matching is done offline from name + level + quality
+-- + known unit kind. Missing/unknown types must never be merged by archetype.
+local function readObjectMetadata(id)
+    local key = eventObjectId(id)
+    if not key then return {} end
+    local session = AOUA.Session
+    session.objectMetadata = session.objectMetadata or {}
+    local cached = session.objectMetadata[key]
+    if cached then return cached end
+    if (tonumber(session.objectMetadataCount) or 0) >= TARGET_METADATA_CACHE_LIMIT then
+        return { kind = "unknown" }
+    end
+
+    local meta = { kind = "unknown" }
+    local exists = true
+    if object and type(object.IsExist) == "function" then
+        local ok, value = pcall(object.IsExist, id)
+        exists = ok and value == true
+    end
+    if exists and object and type(object.IsUnit) == "function" then
+        local okUnit, isUnit = pcall(object.IsUnit, id)
+        if okUnit and isUnit == true then
+            local isMob, isPlayer
+            if type(object.IsMob) == "function" then
+                local ok, value = pcall(object.IsMob, id)
+                if ok then isMob = value == true end
+            end
+            if type(object.IsPlayer) == "function" then
+                local ok, value = pcall(object.IsPlayer, id)
+                if ok then isPlayer = value == true end
+            end
+            if isMob == true then meta.kind = "mob"
+            elseif isPlayer == true then meta.kind = "player"
+            elseif isMob == false and isPlayer == false then meta.kind = "npc"
+            end
+
+            if type(object.GetName) == "function" then
+                local ok, value = pcall(object.GetName, id)
+                if ok then meta.name = eventText(value) or "" end
+            end
+            if unit and type(unit.GetLevel) == "function" then
+                local ok, value = pcall(unit.GetLevel, id)
+                if ok and tonumber(value) then meta.level = tonumber(value) end
+            end
+            if unit and type(unit.GetQuality) == "function" then
+                local ok, value = pcall(unit.GetQuality, id)
+                if ok and tonumber(value) then
+                    meta.quality = tonumber(value)
+                    meta.qualityName = qualityLabel(value)
+                end
+            end
+            if meta.kind == "mob" then meta.isMob = true
+            elseif meta.kind == "player" or meta.kind == "npc" then meta.isMob = false end
+        end
+    end
+
+    session.objectMetadata[key] = meta
+    session.objectMetadataCount = (tonumber(session.objectMetadataCount) or 0) + 1
+    return meta
+end
+
+local function metadataCsv(meta)
+    meta = meta or {}
+    return eventText(meta.name) or "",
+        sampleNumber(meta.level), sampleNumber(meta.quality),
+        eventText(meta.qualityName) or "", meta.kind or "unknown",
+        (meta.isMob == nil) and "" or (meta.isMob and "1" or "0")
+end
+
+-- Aggregate live opponent data for the in-game details panel. Profiles are
+-- keyed by the target ObjectId for this fight; unknown object types are never
+-- merged merely because their metadata is unavailable.
+local function updateTargetProfile(targetKey, targetMeta, amount, hpBefore, hpQuality,
+    hpCurrent, hpLimit, hpPercent, hpAge, element, params)
+    if not targetKey or targetKey == "" then return end
+    local session = AOUA.Session
+    session.targetProfiles = session.targetProfiles or {}
+    local profile = session.targetProfiles[targetKey]
+    if not profile then
+        session.targetProfileCount = (tonumber(session.targetProfileCount) or 0) + 1
+        profile = {
+            ordinal = session.targetProfileCount,
+            name = eventText(targetMeta and targetMeta.name) or "",
+            level = targetMeta and tonumber(targetMeta.level) or nil,
+            quality = targetMeta and tonumber(targetMeta.quality) or nil,
+            qualityName = targetMeta and eventText(targetMeta.qualityName) or "",
+            kind = targetMeta and targetMeta.kind or "unknown",
+            events = 0, damage = 0,
+            resistTotal = 0, resistSamples = 0, resistByElement = {}
+        }
+        session.targetProfiles[targetKey] = profile
+    end
+
+    profile.events = profile.events + 1
+    profile.damage = profile.damage + N(amount)
+    profile.lastSecond = tonumber(session.elapsedSeconds) or 0
+
+    if hpCurrent ~= nil and hpLimit ~= nil and hpLimit > 0 then
+        profile.hpCurrent = hpCurrent
+        profile.hpLimit = hpLimit
+        profile.hpPercent = hpPercent
+        profile.hpSecond = math.max(0, profile.lastSecond - (tonumber(hpAge) or 0))
+    end
+    if hpBefore ~= nil then
+        profile.hpBeforePercent = hpBefore * 100
+        profile.hpBeforeQuality = hpQuality or "unknown"
+        profile.hpBeforeSecond = profile.lastSecond
+    end
+
+    local resist = tonumber(params and params.resist)
+    if resist and resist > 0 then
+        local school = (element and element ~= "") and element or "UNKNOWN"
+        local schoolRow = profile.resistByElement[school]
+        if not schoolRow then
+            schoolRow = { amount = 0, samples = 0 }
+            profile.resistByElement[school] = schoolRow
+        end
+        schoolRow.amount = schoolRow.amount + resist
+        schoolRow.samples = schoolRow.samples + 1
+        profile.resistTotal = profile.resistTotal + resist
+        profile.resistSamples = profile.resistSamples + 1
+    end
+end
+
+-- Public, read-only view consumed by the GUI. HP snapshots remain explicitly
+-- measured; pre-hit HP is exposed separately and must be labelled as an estimate
+-- or as a pre-hit sample rather than as current HP.
+function AOUA.GetTargetDisplayRows(limit)
+    ensureSession()
+    local rows = {}
+    local now = tonumber(AOUA.Session.elapsedSeconds) or 0
+    for _, profile in pairs(AOUA.Session.targetProfiles or {}) do
+        local row = {
+            ordinal = profile.ordinal,
+            name = profile.name,
+            level = profile.level,
+            quality = profile.quality,
+            qualityName = profile.qualityName,
+            kind = profile.kind,
+            events = profile.events,
+            damage = profile.damage,
+            resistTotal = profile.resistTotal or 0,
+            resistSamples = profile.resistSamples or 0,
+            resistSchools = {}
+        }
+        if profile.hpCurrent ~= nil and profile.hpLimit ~= nil and profile.hpLimit > 0 then
+            row.hpAge = math.max(0, now - (tonumber(profile.hpSecond) or now))
+            if row.hpAge <= 30 then
+                row.hpCurrent = profile.hpCurrent
+                row.hpLimit = profile.hpLimit
+                row.hpPercent = profile.hpPercent
+                row.hpQuality = "measured"
+            end
+        end
+        if row.hpCurrent == nil and profile.hpBeforePercent ~= nil then
+            row.hpBeforePercent = profile.hpBeforePercent
+            row.hpBeforeAge = math.max(0, now - (tonumber(profile.hpBeforeSecond) or now))
+            row.hpBeforeQuality = profile.hpBeforeQuality or "unknown"
+        end
+        for school, stat in pairs(profile.resistByElement or {}) do
+            row.resistSchools[#row.resistSchools + 1] = {
+                element = school, amount = stat.amount, samples = stat.samples
+            }
+        end
+        table.sort(row.resistSchools, function(a, b) return a.amount > b.amount end)
+        rows[#rows + 1] = row
+    end
+    table.sort(rows, function(a, b)
+        if (a.damage or 0) == (b.damage or 0) then
+            return (a.events or 0) > (b.events or 0)
+        end
+        return (a.damage or 0) > (b.damage or 0)
+    end)
+    local total = #rows
+    local maximum = math.max(0, math.floor(tonumber(limit) or total))
+    while #rows > maximum do rows[#rows] = nil end
+    return rows, total
 end
 
 -- Refresh innate stats at most once per elapsed fight second interval.
@@ -560,9 +779,31 @@ local function appendEventSample(kind, params, amount, hpBefore, hpQuality, targ
         local ok, target = pcall(Optim.GetTarget)
         if ok then targetId = target end
     end
-    local actorId = params.source
+    local actorId = (kind == "healing" or kind == "receivedHeal")
+        and (params.healerId or params.source) or params.source
     local targetKey = eventObjectId(targetId) or ""
     local actorKey = eventObjectId(actorId) or ""
+    local actorMeta = readObjectMetadata(actorId)
+    local targetMeta = readObjectMetadata(targetId)
+    local actorName, actorLevel, actorQuality, actorQualityName, actorKind, actorIsMob =
+        metadataCsv(actorMeta)
+    local targetName, targetLevel, targetQuality, targetQualityName, targetKind, targetIsMob =
+        metadataCsv(targetMeta)
+    local targetHealth = targetId and AOUA.HpCache[targetId] or nil
+    local targetHpCurrent, targetHpCurrentPercent, targetHpLimit, targetHpSnapshotQuality, targetHpSnapshotAge
+    if targetHealth and targetHealth.real == true and tonumber(targetHealth.value)
+        and tonumber(targetHealth.limit) and targetHealth.limit > 0 then
+        targetHpCurrent = tonumber(targetHealth.value)
+        targetHpLimit = tonumber(targetHealth.limit)
+        targetHpCurrentPercent = targetHpCurrent / targetHpLimit * 100
+        targetHpSnapshotQuality = "measured"
+        local hpSecond = tonumber(targetHealth.second)
+        if hpSecond ~= nil then
+            targetHpSnapshotAge = math.max(0, (tonumber(AOUA.Session.elapsedSeconds) or 0) - hpSecond)
+        end
+    else
+        targetHpSnapshotQuality = "unknown"
+    end
     local recipient = ""
     if kind == "healing" or kind == "receivedHeal" then
         recipient = isLocalObject(targetId) and "self" or "ally"
@@ -589,9 +830,19 @@ local function appendEventSample(kind, params, amount, hpBefore, hpQuality, targ
         recipient, ability,
         sampleNumber(stats.M), sampleNumber(stats.R), sampleNumber(stats.U), sampleNumber(stats.L),
         sampleNumber(stats.S), sampleNumber(stats.W), sampleNumber(stats.B), sampleNumber(stats.C),
-        sampleNumber(stats.HPmax), sampleNumber(snapshotSecond), sampleNumber(snapshotAge)
+        sampleNumber(stats.HPmax), sampleNumber(snapshotSecond), sampleNumber(snapshotAge),
+        actorName, actorLevel, actorQuality, actorQualityName, actorKind, actorIsMob,
+        targetName, targetLevel, targetQuality, targetQualityName, targetKind, targetIsMob,
+        sampleNumber(targetHpCurrent), sampleNumber(targetHpCurrentPercent),
+        sampleNumber(targetHpLimit), targetHpSnapshotQuality or "unknown",
+        sampleNumber(targetHpSnapshotAge)
     }
     samples[sampleIndex] = table.concat(values, "|")
+    if kind == "damage" then
+        updateTargetProfile(targetKey, targetMeta, amount, hpBefore, hpQuality,
+            targetHpCurrent, targetHpLimit, targetHpCurrentPercent, targetHpSnapshotAge,
+            element, params)
+    end
     AOUA.Session.eventSampleCount = sampleCount
     AOUA.Session.eventSampleNext = (sampleIndex % EVENT_BUFFER_LIMIT) + 1
 end
@@ -646,7 +897,7 @@ local function persistEventSamples()
         for i = 1, #combined do section["aou_evt_" .. i] = combined[i] end
         for i = #combined + 1, oldSlots do section["aou_evt_" .. i] = "" end
         section.aou_evt_count = #combined
-        section.aou_evt_schema = "v2"
+        section.aou_evt_schema = "v3"
         section.aou_evt_fight_id = tonumber(AOUA.Session.fightId) or 0
         section.aou_evt_last_dropped = tonumber(AOUA.Session.eventSamplesDropped) or 0
         section.aou_evt_last_seconds = tonumber(AOUA.Session.elapsedSeconds) or 0
@@ -1064,6 +1315,12 @@ function AOUA.OnIncomingDamage(params)
             hpQuality = "unknown"
         end
         targetMaxHp = real and limit or nil
+        if value ~= nil and limit and limit > 0 then
+            AOUA.HpCache[params.target] = {
+                value = value, limit = limit, real = real,
+                second = tonumber(AOUA.Session.elapsedSeconds) or 0
+            }
+        end
     end
     appendEventSample("incoming", params, amount, hpBefore, hpQuality, targetMaxHp, nil, nil)
     recordDamageJournal("incoming", params, amount)

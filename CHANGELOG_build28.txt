@@ -2,6 +2,12 @@ DPScope build 28 - Allods Sunshine 6.0
 ======================================
 
 Changes
+- Opponent summary space now collapses when no readable target rows exist and expands only for rows actually displayed.
+- When the analytics journal has no readable target profile, the opponent panel now reads the current target even if the optional optimizer has no LastEv event; percent-only target HP is shown as an approximate current percentage.
+- The current-target fallback resolves numeric unit-quality enums and strips the Sunshine SubElement enum prefix before rendering resistance schools.
+- The opponent panel now rejects despawned/non-unit event targets, then tries the live avatar target; Optim.GetTarget uses avatar.GetTarget first and only falls back to unit.GetTarget when needed.
+- Added `/aou targettest` to report avatar/unit/event target IDs, object validity, target metadata, HP availability, and live analytics profile counts for runtime diagnosis.
+- Spell, detail, and optimizer panels reflow with the visible opponent section height.
 - Analytics runs from the resolved DPScope combatant pipeline, once per event in the current fight.
 - Personal analytics are filtered to the local player; party member events are not mixed into personal totals.
 - Damage and healing phase reports use target HP snapshots where the game API exposes them.
@@ -182,3 +188,29 @@ Build28 maintenance fixes
 - Fixed the Russian/English OptSchA/OptSchE/OptSchN/OptSchL resource files: they were stored as UTF-16 data while the addon localization resources are UTF-8. This caused the mojibake visible in the bottom school-statistics block.
 - Added a regression test that rejects UTF-16 BOM/NUL bytes in the Russian school-label resources.
 - /aou eventfile is documented as the single AOUCSV export workflow for screenshot/OCR capture; it does not claim unsupported direct disk writes by the game client.
+
+
+Target identity and resistance telemetry:
+- Event export schema v3 appends actor/target names, levels, quality enum/category, unit kind (mob/player/NPC), and best-effort current HP snapshots with quality and age.
+- Original actor_id and target_id ObjectIds remain unchanged; metadata is cached per instance for the duration of a fight and bounded to 512 objects.
+- Offline target_signature uses normalized name + level + quality + known unit kind. Explicitly unknown unit kinds do not get a cross-instance signature and are not merged.
+- The profile now includes target_statistics: target archetypes, event HP distribution, measured current-HP snapshots, and callback resistance/absorption components grouped by damage school.
+- Resistance fields are reported as observed event components (resist, rune absorb, absorb, barrier, block, parry, etc.), not as a target's numeric resistance rating. The API does not document a general target-resistance-rating getter.
+- Target signature matching is an archetype match only; it does not prove the target's full encounter state, buffs, debuffs, equipment or resistance state.
+- Legacy v2 persisted rows remain aligned: v3 columns are appended, so legacy rows receive blank trailing metadata rather than shifted values.
+
+
+In-game opponent statistics panel:
+- Added a "Противники" / "Opponents" block to the selected player's current-fight details panel, listing the four highest-damage targets.
+- Displays target name, unit category (mob/player/NPC/unknown), level, quality, and available HP information.
+- Exact current/max HP and percentage are shown only from a recent exact health snapshot; otherwise the UI labels pre-hit HP percentage as an estimate or shows unavailable.
+- Displays API-reported resisted damage amounts by school and sample count when present. These are event mitigation amounts, not a character resistance rating.
+- Unknown target types remain separated by ObjectId; no cross-object merging is done in the live panel.
+
+
+Opponent panel readability fix:
+- Replaced the old multi-column spell-detail template with a dedicated full-width single-line target row; the previous columns placed HP and resistance values under ambiguous/misaligned headers.
+- Each line now labels target type/level/quality, HP, and event-reported resisted damage by school.
+- Missing target names, names consisting of question marks, unknown unit categories, unresolved quality enums, unavailable HP and unknown damage schools are omitted instead of shown as fake names or placeholders.
+- Target text conversion now detects UTF-8 versus legacy CP1251 strings before conversion, avoiding turning CP1251 object names into question marks.
+- When no target data is available, the opponent block is hidden rather than showing a placeholder line.

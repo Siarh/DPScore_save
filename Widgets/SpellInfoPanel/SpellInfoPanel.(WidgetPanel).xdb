@@ -10,6 +10,7 @@
 		<Item href="SpellHeaderPanel/SpellHeaderPanel.(WidgetPanel).xdb#xpointer(/WidgetPanel)" />
 		<Item href="SpellDetailPanel/SpellDetailPanel.(WidgetPanel).xdb#xpointer(/WidgetPanel)" />
 		<Item href="SpellDetailHeaderPanel/SpellDetailHeaderPanel.(WidgetPanel).xdb#xpointer(/WidgetPanel)" />
+		<Item href="OpponentPanel/OpponentPanel.(WidgetPanel).xdb#xpointer(/WidgetPanel)" />
 		<Item href="TextViews/SpellPlayerName.(WidgetTextView).xdb#xpointer(/WidgetTextView)" />
 	</Children>
 	<BackLayer href="SpellInfoPanel.(WidgetLayerTiledTexture).xdb#xpointer(/WidgetLayerTiledTexture)" />
@@ -21,7 +22,7 @@
 		</X>
 		<Y>
 			<Align>WIDGET_ALIGN_LOW</Align>
-			<Size>826</Size>
+			<Size>923</Size>
 			<Pos>230</Pos>
 		</Y>
 	</Placement>

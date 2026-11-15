@@ -1,0 +1,109 @@
+name: DPScope formula engine tests
+
+on:
+  push:
+    branches: [build28-source]
+    paths:
+      - "tools/aou_formula_calculator.py"
+      - "tools/aou_analyze.py"
+      - "tools/aou_event_history_to_profile.py"
+      - "tools/test_aou_formula_calculator.py"
+      - "tools/test_aou_analytics_journal.lua"
+      - "tools/test_aou_ai.lua"
+      - "tools/test_aou_critical_model.lua"
+      - "tools/test_aou_widget_layout.py"
+      - "tools/aou_ai_assistant.py"
+      - "tools/README_ollama_ai.txt"
+      - "tools/test_aou_ai_assistant.py"
+      - "tools/aou_ai_companion.py"
+      - "tools/aou_extract_usercfg.py"
+      - "tools/test_aou_extract_usercfg.py"
+      - "tools/test_aou_ai_companion.py"
+      - "tools/test_aou_event_history_to_profile.py"
+      - "tools/aou_profile_template.json"
+      - "Scripts/AoUMeterOptim.lua"
+      - "Scripts/AoUMeterGUI.lua"
+      - "Scripts/AoUMeterAI.lua"
+      - "Scripts/AoUMeterAnalytics.lua"
+      - "Scripts/AoUMeterEvents.lua"
+      - "Scripts/AoUMeterInit.lua"
+      - "Scripts/AoUMeterData.lua"
+      - "Locales/**"
+      - "Widgets/**"
+      - "AddonDesc.(UIAddon).xdb"
+      - "AoUMeterSettings.txt"
+      - "AoU_ChatLog_To_CSV.html"
+      - "README_Optimizer.txt"
+      - "CHANGELOG_build28.txt"
+      - "desc.txt"
+      - "name.txt"
+      - "tools/README_formula_calculator.txt"
+      - ".github/workflows/aou-formula-tests.yml"
+  pull_request:
+    branches: [build28-source]
+  workflow_dispatch:
+
+jobs:
+  formula-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Check modified Lua syntax
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lua5.4
+          luac -p Scripts/AoUMeterOptim.lua
+          luac -p Scripts/AoUMeterGUI.lua
+          luac -p Scripts/AoUMeterAI.lua
+          luac -p Scripts/AoUMeterAnalytics.lua
+          luac -p Scripts/AoUMeterEvents.lua
+          luac -p Scripts/AoUMeterInit.lua
+          luac -p Scripts/AoUMeterData.lua
+          luac -p tools/test_aou_analytics_journal.lua
+          luac -p tools/test_aou_critical_model.lua
+      - name: Run analytics journal regression tests
+        working-directory: tools
+        run: |
+          lua test_aou_analytics_journal.lua
+          lua test_aou_ai.lua
+          lua test_aou_critical_model.lua
+      - name: Run unit tests and sample profile
+        working-directory: tools
+        run: |
+          python -m unittest -v test_aou_formula_calculator.py test_aou_ai_assistant.py test_aou_ai_companion.py test_aou_extract_usercfg.py test_aou_event_history_to_profile.py test_aou_widget_layout.py
+          python aou_formula_calculator.py aou_profile_template.json --out formula_test_report.json
+
+
+  package-addon:
+    needs: formula-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Build DPScope build28 archive
+        run: |
+          mkdir -p package/DPScope/tools
+          cp -a Scripts Locales Widgets package/DPScope/
+          cp -a "AddonDesc.(UIAddon).xdb" AoUMeterSettings.txt AoU_ChatLog_To_CSV.html \
+            README_Optimizer.txt CHANGELOG_build28.txt desc.txt name.txt package/DPScope/
+          cp -a tools/aou_formula_calculator.py tools/aou_event_history_to_profile.py \
+            tools/aou_profile_template.json tools/aou_ai_assistant.py tools/aou_ai_companion.py tools/aou_extract_usercfg.py \
+            tools/README_formula_calculator.txt tools/README_ollama_ai.txt package/DPScope/tools/
+          cd package
+          zip -qr ../DPScope-build28.zip DPScope
+          cd ..
+          sha256sum DPScope-build28.zip
+      - name: Upload testable addon archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: DPScope-build28
+          path: DPScope-build28.zip
+          if-no-files-found: error
+          retention-days: 30

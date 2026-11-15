@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+import unittest
+
+from aou_extract_usercfg import (
+    EVENT_COLUMNS,
+    V2_EVENT_COLUMNS,
+    LEGACY_EVENT_COLUMNS,
+    extract_named_table,
+    parse_config_value,
+    parse_dpscope_config,
+)
+
+
+def row(number: int) -> str:
+    fields = [
+        "fight1", "pve", str(number), "damage", "1000", "0.5",
+        "measured_pre", "50000", "player-1", "target-1", "0",
+        "physical", "test", "0", "0", "0", "0", "0", "0", "0",
+        "0", "0", "0", "50", "self", "Ability name", "100", "200",
+        "300", "40", "10", "20", "30", "40", "50000", str(number), "0",
+        "Test Actor", "90", "0", "0", "Test Target", "90", "4", "1",
+    ]
+    assert len(fields) == len(EVENT_COLUMNS.split("|"))
+    return "|".join(fields)
+
+
+def v2_row(number: int) -> str:
+    fields = [
+        "fight1", "pve", str(number), "damage", "1000", "0.5",
+        "measured_pre", "50000", "player-1", "target-1", "0",
+        "physical", "test", "0", "0", "0", "0", "0", "0", "0",
+        "0", "0", "0", "50", "self", "Ability name", "100", "200",
+        "300", "40", "10", "20", "30", "40", "50000", str(number), "0",
+    ]
+    assert len(fields) == len(V2_EVENT_COLUMNS.split("|"))
+    return "|".join(fields)
+
+
+def legacy_row(number: int) -> str:
+    fields = [
+        "fight1", "pve", str(number), "damage", "1000", "0.5",
+        "measured_pre", "50000", "0", "physical", "test", "0",
+        "0", "0", "0", "0", "0", "0", "0", "0", "0", "50",
+        "self", "Ability name", "100", "200", "300", "40", "10",
+        "20", "30", "40", "50000",
+    ]
+    assert len(fields) == len(LEGACY_EVENT_COLUMNS.split("|"))
+    return "|".join(fields)
+
+
+class UserCfgExtractorTests(unittest.TestCase):
+    def test_extracts_dpscope_global_section(self):
+        text = "\n".join([
+            "table_begin ScriptUserMods_DPScope",
+            " table_begin data",
+            '  aou_evt_schema=l"v3"',
+            "  aou_evt_count=2",
+            f'  aou_evt_1=l"{row(1)}"',
+            f'  aou_evt_2=l"{row(2)}"',
+            " table_end data",
+            "table_end ScriptUserMods_DPScope",
+        ])
+        rows, summary = parse_dpscope_config(text)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(summary["stored_events"], 2)
+        self.assertEqual(summary["source_schema"], "v3")
+        self.assertEqual(rows[1].split("|")[2], "2")
+
+    def test_upgrades_v2_rows_without_inventing_entity_descriptors(self):
+        text = "\n".join([
+            "table_begin ScriptUserMods_DPScope",
+            " table_begin data",
+            '  aou_evt_schema=l"v2"',
+            "  aou_evt_count=1",
+            f'  aou_evt_1=l"{v2_row(7)}"',
+            " table_end data",
+            "table_end ScriptUserMods_DPScope",
+        ])
+        rows, summary = parse_dpscope_config(text)
+        fields = dict(zip(EVENT_COLUMNS.split("|"), rows[0].split("|")))
+        self.assertEqual(summary["v2_rows_upgraded"], 1)
+        self.assertEqual(summary["legacy_rows_upgraded"], 0)
+        self.assertEqual(summary["normalized_schema"], "v3")
+        self.assertEqual(fields["actor_id"], "player-1")
+        self.assertEqual(fields["target_id"], "target-1")
+        self.assertEqual(fields["stat_sample_age"], "0")
+        self.assertEqual(fields["target_name"], "")
+        self.assertEqual(fields["target_is_mob"], "")
+
+    def test_ignores_other_addon_tables(self):
+        text = "\n".join([
+            "table_begin ScriptUserMods_OtherAddon",
+            " table_begin data",
+            "  aou_evt_count=99",
+            " table_end data",
+            "table_end ScriptUserMods_OtherAddon",
+            "table_begin ScriptUserMods_DPScope",
+            " table_begin data",
+            "  aou_evt_count=1",
+            f'  aou_evt_1=l"{row(1)}"',
+            " table_end data",
+            "table_end ScriptUserMods_DPScope",
+        ])
+        rows, _ = parse_dpscope_config(text)
+        self.assertEqual(len(rows), 1)
+
+    def test_missing_record_is_rejected(self):
+        text = "\n".join([
+            "table_begin ScriptUserMods_DPScope",
+            " table_begin data",
+            "  aou_evt_count=2",
+            f'  aou_evt_1=l"{row(1)}"',
+            " table_end data",
+            "table_end ScriptUserMods_DPScope",
+        ])
+        with self.assertRaisesRegex(ValueError, "отсутствуют записи"):
+            parse_dpscope_config(text)
+
+    def test_wrong_row_schema_is_rejected(self):
+        text = "\n".join([
+            "table_begin ScriptUserMods_DPScope",
+            " table_begin data",
+            "  aou_evt_count=1",
+            '  aou_evt_1=l"bad|row"',
+            " table_end data",
+            "table_end ScriptUserMods_DPScope",
+        ])
+        with self.assertRaisesRegex(ValueError, "ожидается"):
+            parse_dpscope_config(text)
+
+    def test_quoted_value_unescapes_quotes(self):
+        self.assertEqual(parse_config_value(r'l"abc\"def"'), 'abc"def')
+
+    def test_named_table_extracts_balanced_nested_tables(self):
+        block = extract_named_table(
+            "table_begin outer\n table_begin child\n x=1\n table_end child\n"
+            "table_end outer",
+            "outer",
+        )
+        self.assertIn("table_begin child", block)
+        self.assertIn("x=1", block)
+
+
+    def test_upgrades_legacy_v1_rows_without_inventing_ids_or_snapshot_age(self):
+        text = "\n".join([
+            "table_begin ScriptUserMods_DPScope",
+            " table_begin data",
+            '  aou_evt_schema=l"v1"',
+            "  aou_evt_count=1",
+            f'  aou_evt_1=l"{legacy_row(7)}"',
+            " table_end data",
+            "table_end ScriptUserMods_DPScope",
+        ])
+        rows, summary = parse_dpscope_config(text)
+        fields = dict(zip(EVENT_COLUMNS.split("|"), rows[0].split("|")))
+        self.assertEqual(summary["legacy_rows_upgraded"], 1)
+        self.assertEqual(summary["current_schema_rows"], 0)
+        self.assertEqual(summary["source_schema"], "v1")
+        self.assertEqual(fields["actor_id"], "")
+        self.assertEqual(fields["target_id"], "")
+        self.assertEqual(fields["stat_sample_age"], "")
+        self.assertEqual(fields["M"], "100")
+        self.assertEqual(fields["kind"], "damage")
+
+    def test_reads_all_one_thousand_saved_event_rows(self):
+        lines = [
+            "table_begin ScriptUserMods_DPScope",
+            " table_begin data",
+            '  aou_evt_schema=l"v1"',
+            "  aou_evt_count=1000",
+        ]
+        lines.extend(
+            f'  aou_evt_{index}=l"{legacy_row(index)}"'
+            for index in range(1, 1001)
+        )
+        lines.extend([" table_end data", "table_end ScriptUserMods_DPScope"])
+        rows, summary = parse_dpscope_config("\n".join(lines))
+        self.assertEqual(len(rows), 1000)
+        self.assertEqual(summary["stored_events"], 1000)
+        self.assertEqual(summary["rows_read"], 1000)
+        self.assertEqual(summary["legacy_rows_upgraded"], 1000)
+        self.assertEqual(summary["source_schema"], "v1")
+
+
+
+if __name__ == "__main__":
+    unittest.main()
