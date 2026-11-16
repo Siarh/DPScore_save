@@ -33,7 +33,8 @@ class GlobalInfoLayoutTests(unittest.TestCase):
         self.assertIn("local function targetReadableName", gui)
         self.assertIn('if name ~= "" then parts[#parts + 1] = name end', gui)
         self.assertIn('panel.Line:SetVal("Name", W(line))', gui)
-        self.assertIn('local parts = { russian and "Цель:" or "Target:" }', gui)
+        self.assertIn('local parts = {}', gui)
+        self.assertIn('hpText = "HP " .. string.format("%.0f", hp) .. "/100 ("', gui)
         self.assertIn("dp.OpponentHeader:Hide()", gui)
         self.assertNotIn("Без имени", gui)
         self.assertNotIn("Unnamed", gui)
@@ -56,7 +57,7 @@ class GlobalInfoLayoutTests(unittest.TestCase):
         block = gui[start:end]
         self.assertIn("if allowCurrentTargetFallback then", block)
         self.assertLess(block.index("avatar.GetTarget"), block.index("addCandidate(eventTarget)"))
-        self.assertIn("targetQualityLabel(data.qualityName or data.quality)", block)
+        self.assertIn("row.qualityName = tostring(value)", block)
         self.assertIn("local ev = Optim and Optim.LastEv and Optim.LastEv[enumMode.Dps] or nil", block)
         self.assertIn("common.IsWString", gui)
         self.assertIn("userMods.FromWString", gui)
@@ -67,18 +68,18 @@ class GlobalInfoLayoutTests(unittest.TestCase):
         self.assertIn("avatar.GetTarget", block)
         self.assertIn("for candidateIndex = 1, #candidates do", block)
         self.assertIn("pcall(Optim.GetTarget)", block)
-        self.assertIn('hpText = (russian and "HP " or "HP ") .. "~"', block)
+        self.assertIn('hpText = "HP " .. string.format("%.0f", hp) .. "/100 ("', block)
         self.assertNotIn("if #rows == 0 and Optim and Optim.LastEv", block)
         self.assertIn('key = string.gsub(key, "^ENUM_SubElement_", "")', gui)
         self.assertIn("local numeric = tonumber(key)", gui)
         self.assertIn("row.qualityName = tostring(value)", block)
 
-    def test_target_row_is_under_resolve_in_details_panel(self):
+    def test_target_row_uses_existing_opponent_panel_below_optimizer_title(self):
         gui = (ROOT / "Scripts/AoUMeterGUI.lua").read_text(encoding="utf-8")
         events = (ROOT / "Scripts/AoUMeterEvents.lua").read_text(encoding="utf-8")
 
         self.assertIn("local TARGET_INFO_ROWS = 1", gui)
-        self.assertIn("local TARGET_INFO_HEIGHT = 0 -- target line is inserted dynamically after the optimizer Resolve row", gui)
+        self.assertIn("local TARGET_INFO_HEIGHT = 0 -- target line is placed at the start of the optimizer rows", gui)
         init = gui[gui.index("function TUMeterGUI:Init()"):]
         self.assertIn("local opponentHeaderOffset = GlobalInfoOffset + EXTRATYPES * 18 + 7", init)
         self.assertIn("local opponentRowsOffset = opponentHeaderOffset + 18", init)
@@ -102,16 +103,19 @@ class GlobalInfoLayoutTests(unittest.TestCase):
         self.assertIn("dp.OpponentList[1]:Show()", block)
         self.assertIn('W(russian and "Цель не определена" or "Target not identified")', block)
 
-    def test_target_row_is_inserted_after_resolve_and_shifts_following_rows(self):
+    def test_target_row_is_first_in_analyzer_and_preserves_resolve_ruthlessness_spacing(self):
         gui = (ROOT / "Scripts/AoUMeterGUI.lua").read_text(encoding="utf-8")
         start = gui.index("function TUMeterGUI:UpdateOptim()")
         end = gui.index("\n--------------------------------------------------------------------------------\n-- Fill the spell panel", start)
         block = gui[start:end]
-        self.assertIn('lines[i][1] == "OptR"', block)
-        self.assertIn("if targetInsertIndex and i > targetInsertIndex then", block)
-        self.assertIn("slotIndex = slotIndex + 1", block)
-        self.assertIn("targetPanel:SetPosition(22, y + 18 + targetInsertIndex * 18)", block)
-        self.assertIn("displayRowCount = displayRowCount + 1", block)
+        self.assertIn("local targetRowOffset = hasTargetLine and 1 or 0", block)
+        self.assertIn("local slotIndex = i + targetRowOffset", block)
+        self.assertIn("targetPanel:SetPosition(22, y + 18)", block)
+        self.assertIn("local displayRowCount = #lines + targetRowOffset", block)
+        self.assertNotIn('lines[i][1] == "OptR"', block)
+        optim = (ROOT / "Scripts/AoUMeterOptim.lua").read_text(encoding="utf-8")
+        build = optim[optim.index("function Optim.BuildLines("):optim.index("\nend", optim.index("function Optim.BuildLines("))]
+        self.assertLess(build.index('addT("OptR"'), build.index('addT("OptU"'))
 
     def test_target_and_combatant_checks_use_canonical_object_ids(self):
         util = (ROOT / "Scripts/AoUMeterUtil.lua").read_text(encoding="utf-8")
@@ -144,10 +148,10 @@ class GlobalInfoLayoutTests(unittest.TestCase):
         self.assertIn("local function updateOpponentSectionLayout(dp, displayedRows)", gui)
         self.assertIn("dp.OpponentSectionHeight = 0", gui)
         self.assertIn("local height = 826 + (dp.OpponentSectionHeight or TARGET_INFO_HEIGHT)", gui)
-        self.assertIn('lines[i][1] == "OptR"', gui)
-        self.assertIn("if targetInsertIndex and i > targetInsertIndex then", gui)
-        self.assertIn("targetPanel:SetPosition(22, y + 18 + targetInsertIndex * 18)", gui)
-        self.assertIn("displayRowCount = displayRowCount + 1", gui)
+        self.assertIn("local targetRowOffset = hasTargetLine and 1 or 0", gui)
+        self.assertIn("local slotIndex = i + targetRowOffset", gui)
+        self.assertIn("targetPanel:SetPosition(22, y + 18)", gui)
+        self.assertIn("local displayRowCount = #lines + targetRowOffset", gui)
 
     def test_resolve_value_is_next_to_the_label_and_bar_is_bounded(self):
         gui = (ROOT / "Scripts/AoUMeterGUI.lua").read_text(encoding="utf-8")
