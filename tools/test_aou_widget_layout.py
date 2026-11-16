@@ -79,6 +79,7 @@ class GlobalInfoLayoutTests(unittest.TestCase):
         events = (ROOT / "Scripts/AoUMeterEvents.lua").read_text(encoding="utf-8")
 
         self.assertIn("local TARGET_INFO_ROWS = 1", gui)
+        self.assertIn("OpponentLineVisible = false", gui)
         self.assertIn("local TARGET_INFO_HEIGHT = 0 -- target line is placed at the start of the optimizer rows", gui)
         init = gui[gui.index("function TUMeterGUI:Init()"):]
         self.assertIn("local opponentHeaderOffset = GlobalInfoOffset + EXTRATYPES * 18 + 7", init)
@@ -94,6 +95,8 @@ class GlobalInfoLayoutTests(unittest.TestCase):
         target_call = spell_list.index("self:UpdateOpponentInfo()")
         selected_gate = spell_list.index("if self.SelectedCombatant then")
         self.assertLess(target_call, selected_gate)
+        self.assertEqual(spell_list.count("self:UpdateOptim()"), 1)
+        self.assertGreater(spell_list.index("self:UpdateOptim()"), spell_list.index("if self.Hovering and self.HoveringSpellIndex"))
 
         opponent_start = gui.index("function TUMeterGUI:UpdateOpponentInfo()")
         opponent_end = gui.index("\n--------------------------------------------------------------------------------\n-- Stat optimizer block", opponent_start)
@@ -101,6 +104,7 @@ class GlobalInfoLayoutTests(unittest.TestCase):
         self.assertIn('W(russian and "Цель не определена" or "Target not identified")', block)
         self.assertIn("dp.OpponentHeader:Hide()", block)
         self.assertIn("dp.OpponentList[1]:Show()", block)
+        self.assertIn("dp.OpponentLineVisible = displayedRows > 0", block)
         self.assertIn('W(russian and "Цель не определена" or "Target not identified")', block)
 
     def test_target_row_is_first_in_analyzer_and_preserves_resolve_ruthlessness_spacing(self):
@@ -111,8 +115,12 @@ class GlobalInfoLayoutTests(unittest.TestCase):
         self.assertIn("local targetRowOffset = hasTargetLine and 1 or 0", block)
         self.assertIn("local slotIndex = i + targetRowOffset", block)
         self.assertIn("targetPanel:SetPosition(22, y + 18)", block)
-        self.assertIn("local displayRowCount = #lines + targetRowOffset", block)
+        self.assertIn("local displayRowCount = (lines and #lines or 0) + targetRowOffset", block)
         self.assertNotIn('lines[i][1] == "OptR"', block)
+        self.assertIn("local hasTargetLine = dp.OpponentLineVisible == true", block)
+        self.assertIn("if lines or hasTargetLine then", block)
+        self.assertIn("local displayRowCount = (lines and #lines or 0) + targetRowOffset", block)
+        self.assertNotIn("targetPanel:IsVisible()", block)
         optim = (ROOT / "Scripts/AoUMeterOptim.lua").read_text(encoding="utf-8")
         build = optim[optim.index("function Optim.BuildLines("):optim.index("\nend", optim.index("function Optim.BuildLines("))]
         self.assertLess(build.index('addT("OptR"'), build.index('addT("OptU"'))
@@ -151,7 +159,7 @@ class GlobalInfoLayoutTests(unittest.TestCase):
         self.assertIn("local targetRowOffset = hasTargetLine and 1 or 0", gui)
         self.assertIn("local slotIndex = i + targetRowOffset", gui)
         self.assertIn("targetPanel:SetPosition(22, y + 18)", gui)
-        self.assertIn("local displayRowCount = #lines + targetRowOffset", gui)
+        self.assertIn("local displayRowCount = (lines and #lines or 0) + targetRowOffset", gui)
 
     def test_resolve_value_is_next_to_the_label_and_bar_is_bounded(self):
         gui = (ROOT / "Scripts/AoUMeterGUI.lua").read_text(encoding="utf-8")
